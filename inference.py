@@ -12,6 +12,11 @@ import gc
 from model_v5 import CGA_ResUNet
 from model_v3 import DSCA_ResUNet_v3
 from model_v6 import CGTA_ResUNet
+# v6 is SR-agnostic at inference: it always extracts features at the same rate it
+# was trained at. Pulling these directly from train_v6.py (instead of redefining
+# them here) means there's a single source of truth -- if you ever retrain v6 at
+# a different SAMPLE_RATE, inference picks it up automatically, no drift possible.
+from train_v6 import SAMPLE_RATE as V6_CANONICAL_SR, N_FFT as V6_N_FFT, N_MELS as V6_N_MELS
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -453,10 +458,15 @@ def processing():
                 wav_for_inference = inject_stability_noise(wav_for_inference, sr, wav.device)
 
             # Dynamic model loading based on Sample Rate.
+            # v6 is SR-agnostic: cached under a fixed key rather than by native SR,
+            # so it's loaded once and reused for every file no matter what SR that
+            # file actually is.
             current_hop = sr // 100
-            if sr not in loaded_models:
+            model_cache_key = "v6" if MODEL_VERSION == "v6" else sr
 
-                # Release previous model if switching SR
+            if model_cache_key not in loaded_models:
+
+                # Release previous model if switching SR / model
                 if len(loaded_models) > 0:
                     print("Unloading previous model to free VRAM...")
                     loaded_models.clear()
@@ -475,7 +485,10 @@ def processing():
                     print(f"Skipping {fname}: No {MODEL_VERSION} model for {sr}Hz")
                     continue
 
-                print(f"Loading {sr}Hz {MODEL_VERSION} model ...")
+                if MODEL_VERSION == "v6":
+                    print(f"Loading {MODEL_VERSION} model (canonical {V6_CANONICAL_SR}Hz, SR-agnostic) ...")
+                else:
+                    print(f"Loading {sr}Hz {MODEL_VERSION} model ...")
 
                 if MODEL_VERSION == "v3":
                     model = DSCA_ResUNet_v3(n_channels=2, n_classes=1).to(device)   # v3
@@ -490,30 +503,57 @@ def processing():
                 model.load_state_dict(torch.load(model_path, map_location=device))
                 model.eval()
 
-                # mel transform config
-                if sr in [48000, 40000]:
-                    N_FFT = 2048
-                    N_MELS = 160
+                if MODEL_VERSION == "v6":
+                    # Fixed mel front-end regardless of the input file's native SR.
+                    # Audio gets resampled to V6_CANONICAL_SR before this transform
+                    # ever sees it (below), so every mel bin always has the exact
+                    # same frequency meaning the model was trained on -- that's what
+                    # actually makes this SR-agnostic, not just a bigger hop_length.
+                    N_MELS = V6_N_MELS
+                    model_hop = V6_CANONICAL_SR // 100
+                    mel_transform = torchaudio.transforms.MelSpectrogram(
+                        sample_rate=V6_CANONICAL_SR, n_mels=V6_N_MELS, n_fft=V6_N_FFT, hop_length=model_hop
+                    ).to(device)
+                    dummy_frames = int(math.ceil((SEGMENT_LEN * V6_CANONICAL_SR) / model_hop)) + 5
                 else:
-                    N_FFT = 1024 # for 32khz model variant.
-                    N_MELS = 128
+                    # mel transform config
+                    if sr in [48000, 40000]:
+                        N_FFT = 2048
+                        N_MELS = 160
+                    else:
+                        N_FFT = 1024 # for 32khz model variant.
+                        N_MELS = 128
 
-                mel_transform = torchaudio.transforms.MelSpectrogram(
-                    sample_rate=sr, n_mels=N_MELS, n_fft=N_FFT, hop_length=current_hop
-                ).to(device)
+                    mel_transform = torchaudio.transforms.MelSpectrogram(
+                        sample_rate=sr, n_mels=N_MELS, n_fft=N_FFT, hop_length=current_hop
+                    ).to(device)
+                    dummy_frames = int(math.ceil((SEGMENT_LEN * sr) / current_hop)) + 5
 
                 # we're pre-allocating a static buffer for the model input
                 # Shape: [Batch, Channels, Mel_Bins, Frames_per_60s_chunk]
                 # Channels = 2 (Mel + Delta)
-                dummy_frames = int(math.ceil((SEGMENT_LEN * sr) / current_hop)) + 5
                 static_buffer = torch.zeros((1, 2, N_MELS, dummy_frames), device=device)
 
-                loaded_models[sr] = (model, mel_transform, static_buffer)
+                loaded_models[model_cache_key] = (model, mel_transform, static_buffer)
 
-            curr_model, curr_mel_transform, curr_buffer = loaded_models[sr]
+            curr_model, curr_mel_transform, curr_buffer = loaded_models[model_cache_key]
 
             # Inference (GPU-accelerated, CPU accumulation)
-            mel_mask = process_grid_aligned(curr_model, curr_mel_transform, wav_for_inference, sr, current_hop, device, curr_buffer)
+            if MODEL_VERSION == "v6":
+                # Resample to the canonical rate for feature extraction ONLY. The
+                # original 'wav' (native SR) is untouched and is what SmartCutter
+                # actually cuts below, so output SR/quality is unaffected -- this
+                # resample is purely so the model sees what it was trained on.
+                wav_for_model = wav_for_inference
+                if sr != V6_CANONICAL_SR:
+                    wav_for_model = torchaudio.functional.resample(wav_for_inference, sr, V6_CANONICAL_SR)
+
+                mel_mask = process_grid_aligned(
+                    curr_model, curr_mel_transform, wav_for_model,
+                    V6_CANONICAL_SR, V6_CANONICAL_SR // 100, device, curr_buffer
+                )
+            else:
+                mel_mask = process_grid_aligned(curr_model, curr_mel_transform, wav_for_inference, sr, current_hop, device, curr_buffer)
 
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
