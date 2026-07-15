@@ -11,6 +11,7 @@ import gc
 
 from model_v5 import CGA_ResUNet
 from model_v3 import DSCA_ResUNet_v3
+from model_v6 import CGTA_ResUNet
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -463,7 +464,13 @@ def processing():
                     if device.type == 'cuda':
                         torch.cuda.empty_cache()
 
-                model_path = os.path.join(CKPT_DIR, f"{MODEL_VERSION}_model_{sr}.pth")
+                if MODEL_VERSION == "v6":
+                    # v6 uses a single canonical checkpoint (trained on the repo's
+                    # canonical sample rate), not one file per SR like v3/v5.
+                    model_path = os.path.join(CKPT_DIR, "v6_model_universal.pth")
+                else:
+                    model_path = os.path.join(CKPT_DIR, f"{MODEL_VERSION}_model_{sr}.pth")
+
                 if not os.path.exists(model_path):
                     print(f"Skipping {fname}: No {MODEL_VERSION} model for {sr}Hz")
                     continue
@@ -474,6 +481,8 @@ def processing():
                     model = DSCA_ResUNet_v3(n_channels=2, n_classes=1).to(device)   # v3
                 elif MODEL_VERSION == "v5":
                     model = CGA_ResUNet(n_channels=2, n_classes=1).to(device)       # v5
+                elif MODEL_VERSION == "v6":
+                    model = CGTA_ResUNet(n_channels=2, n_classes=1).to(device)      # v6
                 else:
                     print(f"'{MODEL_VERSION}' is not a valid model version choice. Exiting.")
                     sys.exit(1)
