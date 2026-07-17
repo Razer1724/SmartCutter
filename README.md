@@ -38,8 +38,7 @@
 <br/>
  
 ✨ to-do list ✨
-> - ~~Better pretrained models.~~ done.
-> - Eventually ( potentially ) move over to v5 arch ~ Bigger dataset's needed.
+> - Better pretrained models
  
 💡 Ideas / concepts 💡
 > - Currently none. Open to your ideas ~
@@ -58,10 +57,8 @@ Run the installation script:
  
 ### PRETRAINED MODELS:
 
-- Download all 3 checkpoints ( Each ~54mb ):)<br/>
-[v3_model_48000](https://huggingface.co/Codename0/SmartCutter/resolve/main/v3_model_48000.pth?download=true)<br/>
-[v3_model_40000](https://huggingface.co/Codename0/SmartCutter/resolve/main/v3_model_40000.pth?download=true)<br/>
-[v3_model_32000](https://huggingface.co/Codename0/SmartCutter/resolve/main/v3_model_32000.pth?download=true)<br/>
+- Download the checkpoint <br/>
+[v6_model](https://huggingface.co/Razer112/smartcutter-omi/resolve/main/v6_omi.pth?download=true)<br/>
 - Put them in SmartCutter's "ckpts" folder
  
 ### INFERENCE:
