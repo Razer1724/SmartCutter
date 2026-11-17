@@ -12,6 +12,7 @@ import gc
 from model_v5 import CGA_ResUNet
 from model_v3 import DSCA_ResUNet_v3
 from model_v6 import CGTA_ResUNet
+from cutter import CutConfig, smart_cut, apply_fade   # shared, fixed cutting logic (see cutter.py)
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -49,30 +50,6 @@ SAFETY_BUFFER_MS = 5
 SEGMENT_LEN = 8.0
 
 
-
-def get_cosine_fade(length, device):
-    # Generates a raised cosine curve (half-Hanning).
-    # It's mathematically smoother than a linear fade, protecting spectral integrity.
-    t = torch.linspace(0, math.pi, length, device=device)
-    fade_curve = 0.5 * (1 - torch.cos(t))
-    return fade_curve
-
-def apply_fade(waveform, fade_samples, mode="both"):
-    # Applies the cosine fade
-    if waveform.shape[1] < fade_samples * 2:
-        return waveform
-
-    fade_curve = get_cosine_fade(fade_samples, waveform.device)
-
-    if mode == "in" or mode == "both":
-        # Fade In: curve goes 0 -> 1
-        waveform[:, :fade_samples] *= fade_curve
-
-    if mode == "out" or mode == "both":
-        # Fade Out: flip the curve so it goes 1 -> 0
-        waveform[:, -fade_samples:] *= fade_curve.flip(0)
-
-    return waveform
 
 def inject_stability_noise(wav, sr, device):
     """
@@ -115,168 +92,23 @@ def inject_stability_noise(wav, sr, device):
 
     return wav
 
-def find_cuts(mask, waveform, sr):
-    # Heavy lifter for phase-aware cutting:
-    # 1. Finds rough cut points based on the prediction mask.
-    # 2. FILTERS segments < 100ms
-    # 3. Scans the actual audio for Zero Crossings (where signal crosses 0).
-    # 4. Snaps the rough cuts to the nearest Zero Crossing to prevent clicking/popping.
-
-    if mask.device.type != 'cpu': mask = mask.cpu()
-    if waveform.device.type != 'cpu': waveform = waveform.cpu()
-
-    mask_binary = (mask > CUTTING_PROBABILITY).float()
-
-    # Identify edges of silence: 1 is start of silence, -1 is end.
-    diff = torch.diff(mask_binary, prepend=torch.tensor([0]), append=torch.tensor([0]))
-
-    rough_starts = torch.where(diff == 1)[0]
-    rough_ends = torch.where(diff == -1)[0]
-
-    if len(rough_starts) == 0:
-        return [], []
-
-    # Convert ms to samples
-    min_samples = int(sr * (MIN_SEGMENT_DURATION_MS / 1000.0))
-
-    # Calculate durations for all found segments
-    durations = rough_ends - rough_starts
-
-    # Keep only indices where duration >= min_samples
-    valid_indices = torch.where(durations >= min_samples)[0]
-
-    if len(valid_indices) == 0:
-        return [], []
-
-    # Update starts and ends to only include valid segments
-    rough_starts = rough_starts[valid_indices]
-    rough_ends = rough_ends[valid_indices]
-
-    buffer_samples = int(sr * (SAFETY_BUFFER_MS / 1000.0))
-    
-    rough_starts = rough_starts + buffer_samples
-    rough_ends = rough_ends - buffer_samples
-
-    # Ensure we didn't invert the segment (start > end) after shrinking
-    # This theoretically shouldn't happen if Min > 2*Buffer (100ms > 10ms), but better safe than sorry.
-    valid_shrink = rough_ends > rough_starts
-    rough_starts = rough_starts[valid_shrink]
-    rough_ends = rough_ends[valid_shrink]
-    # Flatten to mono to find crossings.
-    wav_mono = waveform.mean(dim=0) 
-
-    # Calculate differences in sign to find exact crossing indices.
-    zero_crossings = torch.diff(torch.sign(wav_mono))
-
-    # We want indices where the sign actually changed.
-    valid_zc_indices = torch.where(zero_crossings != 0)[0]
-
-    # If the audio is pure silence or DC offset, fallback to rough cuts.
-    if len(valid_zc_indices) == 0:
-        return rough_starts, rough_ends
-
-    # Helper to find the index in 'candidates' closest to 'targets'.
-    def snap_to_nearest(targets, candidates):
-        # Find insertion points.
-        idx = torch.searchsorted(candidates, targets)
-
-        # Keep within array bounds.
-        idx = torch.clamp(idx, 0, len(candidates) - 1)
-        prev_idx = torch.clamp(idx - 1, 0, len(candidates) - 1)
-
-        val_at_idx = candidates[idx]
-        val_at_prev = candidates[prev_idx]
-
-        # Check if the previous neighbor was actually closer.
-        dist_idx = torch.abs(targets - candidates[idx])
-        dist_prev = torch.abs(targets - candidates[prev_idx])
-
-        return torch.where(dist_prev < dist_idx, candidates[prev_idx], candidates[idx])
-
-    search_win_samples = int(sr * (SEARCH_WINDOW_MS / 1000))
-
-    # Snap rough cuts to the nearest safe zero-crossing.
-    safe_starts = snap_to_nearest(rough_starts, valid_zc_indices)
-    safe_ends = snap_to_nearest(rough_ends, valid_zc_indices)
-
-    # If the nearest ZC is too far away, just use the rough cut.
-    start_diff = torch.abs(safe_starts - rough_starts)
-    safe_starts = torch.where(start_diff < search_win_samples, safe_starts, rough_starts)
-
-    end_diff = torch.abs(safe_ends - rough_ends)
-    safe_ends = torch.where(end_diff < search_win_samples, safe_ends, rough_ends)
-
-    return safe_starts, safe_ends
-
 def SmartCutter(waveform, mask, sr=48000):
-    waveform = waveform.cpu()
-    mask = mask.cpu()
-
-    if ENABLE_BRIDGING:
-        # Gap bridge operation
-        bridge_frames = 5 # At 100fps, 50ms is ~5 frames
-        mask = mask.view(1, 1, -1)
-
-        mask = torch.nn.functional.max_pool1d(mask, bridge_frames, 1, bridge_frames//2) # Dilation
-        mask = -torch.nn.functional.max_pool1d(-mask, bridge_frames, 1, bridge_frames//2) # Erosion
-
-    # Interpolate the low-res mask up to the full audio resolution.
-    if mask.dim() == 1: mask = mask.view(1, 1, -1)
-    elif mask.dim() == 2: mask = mask.unsqueeze(1)
-
-    target_size = waveform.shape[1]
-
-    mask_full = torch.nn.functional.interpolate(
-        mask, size=target_size, mode='linear', align_corners=True
-    ).squeeze()
-
-    # Calculate where to cut.
-    starts, ends = find_cuts(mask_full, waveform, sr)
-
-    # If mask is empty, return silence.
-    if len(starts) == 0:
-        return torch.zeros_like(waveform), mask_full
-
-    target_silence_samples = int(sr * SILENCE_TARGET_DURATION)
-    fade_samples = int(sr * (FADE_DURATION_MS / 1000))
-
-    pieces = []
-    last_valid_idx = 0
-
-    # Pre-allocate silence
-    silence_tensor = torch.zeros((waveform.shape[0], target_silence_samples))
-
-    start_list = starts.tolist()
-    end_list = ends.tolist()
-
-    for start_idx, end_idx in zip(start_list, end_list):
-        start_idx = int(start_idx)
-        end_idx = int(end_idx)
-
-        # Only process if there's actual data to cut.
-        if start_idx > last_valid_idx:
-            speech_chunk = waveform[:, last_valid_idx:start_idx].clone()
-
-            # Apply fades to the edges of the chunk to prevent clicks.
-            if last_valid_idx > 0:
-                speech_chunk = apply_fade(speech_chunk, fade_samples, mode="in")
-
-            speech_chunk = apply_fade(speech_chunk, fade_samples, mode="out")
-            pieces.append(speech_chunk)
-
-        # Insert clean silence between chunks.
-        pieces.append(silence_tensor)
-        last_valid_idx = end_idx
-
-    # Handle any remaining audio at the end.
-    if last_valid_idx < target_size:
-        tail_chunk = waveform[:, last_valid_idx:].clone()
-        if last_valid_idx > 0:
-            tail_chunk = apply_fade(tail_chunk, fade_samples, mode="in")
-        pieces.append(tail_chunk)
-
-    # Merge everything back into one tensor.
-    return torch.cat(pieces, dim=1), mask_full
+    # All cutting logic lives in cutter.py (shared with v7). Fixes vs. the old in-file version:
+    #  - no detected silence  -> audio returned UNCHANGED (it used to return all zeros)
+    #  - zero-crossing snap   -> start moves forward only, end moves backward only
+    #  - gaps that would not make the file shorter are left alone
+    #  - exact time-based frame->sample mapping (old align_corners stretch drifted ~10-20 ms)
+    cfg = CutConfig(
+        threshold=CUTTING_PROBABILITY,
+        min_segment_ms=MIN_SEGMENT_DURATION_MS,
+        safety_buffer_ms=SAFETY_BUFFER_MS,
+        search_window_ms=SEARCH_WINDOW_MS,
+        fade_ms=FADE_DURATION_MS,
+        target_silence_s=SILENCE_TARGET_DURATION,
+        bridging=ENABLE_BRIDGING,
+    )
+    probs = mask.reshape(-1).float().cpu().numpy()
+    return smart_cut(waveform, probs, sr, cfg)
 
 def process_grid_aligned(model, transform, waveform, sr, hop_length, device, static_input_buffer):
     # Implements Weighted Overlap-Add (WOLA) inference.
@@ -517,20 +349,17 @@ def processing():
                 torch.cuda.empty_cache()
 
             # SmartCutter on CPU.
-            cleaned, binary_mask = SmartCutter(wav, mel_mask, sr=sr)
+            cleaned, cut_starts, cut_ends = SmartCutter(wav, mel_mask, sr=sr)
+            print(f"    -> {len(cut_starts)} cuts, {wav.shape[1]/sr:.2f}s -> {cleaned.shape[1]/sr:.2f}s")
 
-            # Debug section
+            # Debug section: noise is laid over exactly the regions that were cut
             if DEBUG_MASK_PRED:
-                if binary_mask.dim() > 2: binary_mask = binary_mask.squeeze(0)
-
-                binary_mask_interpolated = torch.nn.functional.interpolate(
-                    binary_mask.view(1,1,-1), size=wav.shape[1], mode='nearest'
-                ).squeeze()
-
+                cut_region = torch.zeros(wav.shape[1])
+                for s, e in zip(cut_starts.tolist(), cut_ends.tolist()):
+                    cut_region[s:e] = 1.0
                 debug_noise = torch.randn_like(wav) * 0.09
-                debug_wav = wav + (debug_noise * (binary_mask_interpolated > CUTTING_PROBABILITY).float())
+                debug_wav = wav + (debug_noise * cut_region.unsqueeze(0))
                 torchaudio.save(os.path.join(OUT_DIR, "debug_" + os.path.basename(f_path)), debug_wav, sr)
-
 
             # Volume Normalization
             peak = torch.abs(cleaned).max()
@@ -566,13 +395,11 @@ def processing():
             if 'wav_for_inference' in locals(): del wav_for_inference
 
             # masks and intermediate tensors
-            if 'binary_mask' in locals(): del binary_mask
             if 'mel_mask' in locals(): del mel_mask
 
             # Delete debug pieces
             if 'debug_wav' in locals(): del debug_wav
             if 'debug_noise' in locals(): del debug_noise
-            if 'binary_mask_interpolated' in locals(): del binary_mask_interpolated
 
             # Current buffer ( GPU )
             if 'curr_buffer' in locals(): curr_buffer.zero_()
