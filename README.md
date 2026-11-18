@@ -1,63 +1,80 @@
-# <p align="center">` SmartCutter ` </p>
+# SmartCutter v9
 
-<p align="center"> ㅤㅤ👇 You can join this discord server below ( RVC / AI Audio friendly ) 👇ㅤㅤ </p>
+SmartCutter v9 prepares audio for Applio/RVC by shortening removable gaps while
+preserving vocals. This upgrade starts from v3 and adds a temporal segmentation
+pipeline, explicit annotations, conservative cut planning, and native-rate
+multichannel rendering.
 
-</p>
-<p align="center">
-  <a href="https://discord.gg/ymfdwx5jwZ" target="_blank"> Codename's Sanctuary</a>
-</p>
+Version **9.0.0**. The v9 architecture requires training. No pretrained temporal checkpoint or
+real-data quality benchmark is included.
 
-<p align="center"> ㅤㅤ👆 To stay up-to-date with advancements, hang out or get support 👆ㅤㅤ </p>
+**[Full installation and upgrade guide](docs/UPGRADE.md)**
 
-## <p align="center"> A lil bit more about the project:
+## What is implemented
 
-### <p align="center"> Machine Learning based silence-truncation. <br/> Made with Applio / RVC and my Codename-RVC-Fork-4 in mind. ✨ <br/>
-### What's new:
-- Supports any sample rate
-- Might be better?
+- A shared 32 kHz analysis frontend with short/long spectral windows and absolute
+  energy features; output retains the original sample rate.
+- A frequency encoder and a 5.25-million-parameter Conformer segmenter, with
+  removable-gap and boundary heads. A TCN alternative is included.
+- Checked raw/marked imports, explicit interval labels, speaker/source split
+  validation, short-file/tail crops, and label-aware augmentation.
+- Weighted vocal-preservation training, validation-only threshold calibration,
+  full training checkpoints, and resume.
+- Conservative cut decisions, channel vetoes, bounded waveform refinement,
+  native audio rendering, and reviewable edit lists with source/output time maps.
+- Whole-recording metrics, experiment configurations, regression tests, and CI.
+- Repairs to v3 probability handling, no-cut behavior, file pairing, preprocessing,
+  checkpoint loading, stereo handling, and inference frame coverage.
 
-ㅤ
-<br/>
-# ⚠️ㅤ**IMPORTANT** ㅤ⚠️
-- For now only CUDA ( nvidia ) or CPU.
-- Supportes all sample rates<br/>
-- Silence / Sub-Silence ( noisy ) spacings below 100ms are ignored / not processed by design.
-- There are limits, it is still a very-low-noise or pure silence focused truncator.
-( So keep in mind models might hiccup on some really hard cases. ) <br/>
-<br/>
- 
-✨ to-do list ✨
-> - Better pretrained models
- 
-💡 Ideas / concepts 💡
-> - Currently none. Open to your ideas ~
- 
- 
-### ❗ For contact, please join the discord server ❗
- <br/>
- 
-## Getting Started:
+## Install
 
-### INSTALLATION:
+Use Python 3.10–3.12 in a virtual environment. For CPU:
 
-Run the installation script:
+```sh
+python -m pip install torch==2.7.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cpu
+python -m pip install -e .
+python -m smartcutter --version
+python -m smartcutter --help
+```
 
-- Double-click `install.bat`.
- 
-### PRETRAINED MODELS:
+Use a matching CUDA build of PyTorch for NVIDIA GPU training. The existing
+Windows installer environment also supports the new modules.
 
-- Download the checkpoint <br/>
-[v6_model](https://huggingface.co/Razer112/smartcutter-omi/resolve/main/v6_omi.pth?download=true)<br/>
-- Put them in SmartCutter's "ckpts" folder
- 
-### INFERENCE:
- 
-To start inference:
-- First put the concatenated sample or samples ( .wav or .flac ) into "infer_input" dir.
-- Double-click `run-infer.bat`.
-- Results will land in "infer_output" dir.<br/>
-`( Concatenated = Simply join up all samples / segments into 1 file )`<br/><br/>`NOTE: supports multiple samples AND multiple sr.`
- 
-### TRAINING:
-- Training of custom pretrains is supported. <br/> Instruction regarding that will be published in future.
- 
+## Train and use
+
+First prepare a reviewed manifest containing real audio and interval labels,
+with independent training, validation, and test groups. Conversion, schema, and
+splitting instructions are in [the guide](docs/UPGRADE.md).
+
+```sh
+python -m smartcutter validate-data data/manifest.jsonl
+python -m smartcutter train data/manifest.jsonl --config configs/v9.json --output runs/v9
+python -m smartcutter evaluate data/manifest.jsonl --checkpoint runs/v9/best.pt --output reports/v9.json
+python -m smartcutter infer infer_input --checkpoint runs/v9/best.pt --output previews --dry-run
+python -m smartcutter infer infer_input --checkpoint runs/v9/best.pt --output infer_output
+```
+
+On Windows, `run_train_v9.bat` and `run_infer_v9.bat` use the paths
+above in the existing `env` environment. Original launchers remain v3 entry
+points. The guide also shows how to use v3 weights with the new planner and
+renderer; v3 weights cannot initialize the new temporal architecture.
+
+The `configs/` directory includes matched Conformer, TCN, single-resolution,
+and boundary-head experiments. Benchmark them on your held-out recordings and
+listen around the cuts before choosing a replacement for v3.
+
+## Verify
+
+```sh
+python -m unittest discover -s tests -v
+```
+
+The suite exercises both model variants, native-rate rendering, preservation
+regressions, labels/splits, training/resume, and CLI flows. CI is configured for
+Linux and Windows on Python 3.10 and 3.12.
+
+## License and origin
+
+MIT; see [LICENSE](LICENSE). This project began as machine-learning silence
+truncation for Applio/RVC and Codename-RVC-Fork-4. Original community:
+[Codename's Sanctuary](https://discord.gg/ymfdwx5jwZ).

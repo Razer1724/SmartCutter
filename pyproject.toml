@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smartcutter-vocal"
+version = "9.0.0"
+description = "SmartCutter v9: vocal-preserving temporal audio segmentation and cut planning"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = {text = "MIT"}
+dynamic = ["dependencies"]
+
+[project.scripts]
+smartcutter = "smartcutter.__main__:main"
+
+[project.optional-dependencies]
+dev = ["ruff==0.17.5"]
+
+[tool.setuptools]
+py-modules = ["model_v3", "model_v9", "train_v9", "inference_v9"]
+
+[tool.setuptools.packages.find]
+include = ["smartcutter*"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

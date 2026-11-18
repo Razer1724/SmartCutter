@@ -2,16 +2,14 @@ import os
 import sys
 import torch
 import torchaudio
-import torchaudio.functional as F_audio
-import soundfile as sf
 import glob
-import numpy as np
 import math
 import gc
 
-from model_v5 import CGA_ResUNet
 from model_v3 import DSCA_ResUNet_v3
-from model_v6 import CGTA_ResUNet
+from smartcutter.config import CutConfig
+from smartcutter.cuts import plan_cuts, render_audio, runs, _inward_snap
+from smartcutter.frontend import legacy_features
 
 # ---------------------------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -30,7 +28,6 @@ MIN_SEGMENT_DURATION_MS = 100                           #   Minimum length for d
 STABILITY_NOISE = False                                 #   Injects subtle noise into pure silence to stabilize the model
 STABILITY_DB_LEVEL = -75.0                              #   The dB level of the injected noise  ( -80 is minimum;  Model's limitation. )
 STABILITY_FADE_MS = 1                                   #   Fade duration (ms) for the injected noise edges to be softer
-ENABLE_BRIDGING = True                                  #   Filling of the mask/prediction gaps - Only use when and if you debug the mask output and notice gaps.
 
 #  PATHS
 IN_DIR = "infer_input"
@@ -116,288 +113,79 @@ def inject_stability_noise(wav, sr, device):
     return wav
 
 def find_cuts(mask, waveform, sr):
-    # Heavy lifter for phase-aware cutting:
-    # 1. Finds rough cut points based on the prediction mask.
-    # 2. FILTERS segments < 100ms
-    # 3. Scans the actual audio for Zero Crossings (where signal crosses 0).
-    # 4. Snaps the rough cuts to the nearest Zero Crossing to prevent clicking/popping.
-
-    if mask.device.type != 'cpu': mask = mask.cpu()
-    if waveform.device.type != 'cpu': waveform = waveform.cpu()
-
-    mask_binary = (mask > CUTTING_PROBABILITY).float()
-
-    # Identify edges of silence: 1 is start of silence, -1 is end.
-    diff = torch.diff(mask_binary, prepend=torch.tensor([0]), append=torch.tensor([0]))
-
-    rough_starts = torch.where(diff == 1)[0]
-    rough_ends = torch.where(diff == -1)[0]
-
-    if len(rough_starts) == 0:
-        return [], []
-
-    # Convert ms to samples
-    min_samples = int(sr * (MIN_SEGMENT_DURATION_MS / 1000.0))
-
-    # Calculate durations for all found segments
-    durations = rough_ends - rough_starts
-
-    # Keep only indices where duration >= min_samples
-    valid_indices = torch.where(durations >= min_samples)[0]
-
-    if len(valid_indices) == 0:
-        return [], []
-
-    # Update starts and ends to only include valid segments
-    rough_starts = rough_starts[valid_indices]
-    rough_ends = rough_ends[valid_indices]
-
-    buffer_samples = int(sr * (SAFETY_BUFFER_MS / 1000.0))
-    
-    rough_starts = rough_starts + buffer_samples
-    rough_ends = rough_ends - buffer_samples
-
-    # Ensure we didn't invert the segment (start > end) after shrinking
-    # This theoretically shouldn't happen if Min > 2*Buffer (100ms > 10ms), but better safe than sorry.
-    valid_shrink = rough_ends > rough_starts
-    rough_starts = rough_starts[valid_shrink]
-    rough_ends = rough_ends[valid_shrink]
-    # Flatten to mono to find crossings.
-    wav_mono = waveform.mean(dim=0) 
-
-    # Calculate differences in sign to find exact crossing indices.
-    zero_crossings = torch.diff(torch.sign(wav_mono))
-
-    # We want indices where the sign actually changed.
-    valid_zc_indices = torch.where(zero_crossings != 0)[0]
-
-    # If the audio is pure silence or DC offset, fallback to rough cuts.
-    if len(valid_zc_indices) == 0:
-        return rough_starts, rough_ends
-
-    # Helper to find the index in 'candidates' closest to 'targets'.
-    def snap_to_nearest(targets, candidates):
-        # Find insertion points.
-        idx = torch.searchsorted(candidates, targets)
-
-        # Keep within array bounds.
-        idx = torch.clamp(idx, 0, len(candidates) - 1)
-        prev_idx = torch.clamp(idx - 1, 0, len(candidates) - 1)
-
-        val_at_idx = candidates[idx]
-        val_at_prev = candidates[prev_idx]
-
-        # Check if the previous neighbor was actually closer.
-        dist_idx = torch.abs(targets - candidates[idx])
-        dist_prev = torch.abs(targets - candidates[prev_idx])
-
-        return torch.where(dist_prev < dist_idx, candidates[prev_idx], candidates[idx])
-
-    search_win_samples = int(sr * (SEARCH_WINDOW_MS / 1000))
-
-    # Snap rough cuts to the nearest safe zero-crossing.
-    safe_starts = snap_to_nearest(rough_starts, valid_zc_indices)
-    safe_ends = snap_to_nearest(rough_ends, valid_zc_indices)
-
-    # If the nearest ZC is too far away, just use the rough cut.
-    start_diff = torch.abs(safe_starts - rough_starts)
-    safe_starts = torch.where(start_diff < search_win_samples, safe_starts, rough_starts)
-
-    end_diff = torch.abs(safe_ends - rough_ends)
-    safe_ends = torch.where(end_diff < search_win_samples, safe_ends, rough_ends)
-
-    return safe_starts, safe_ends
+    """Legacy sample-mask API. Snapping may only shrink the approved interval."""
+    mask = mask.detach().cpu().reshape(-1)
+    if mask.numel() != waveform.shape[-1]:
+        raise ValueError("Sample mask and audio lengths differ")
+    starts, ends = [], []
+    margin = round(sr * SAFETY_BUFFER_MS / 1000)
+    minimum = round(sr * MIN_SEGMENT_DURATION_MS / 1000)
+    for first, last in runs((mask > CUTTING_PROBABILITY).numpy()):
+        if last - first < minimum or last - first <= 2 * margin:
+            continue
+        start, end = _inward_snap(waveform.detach().cpu().numpy(), first + margin, last - margin,
+                                  round(sr * SEARCH_WINDOW_MS / 1000))
+        if start < end:
+            starts.append(start)
+            ends.append(end)
+    return torch.tensor(starts, dtype=torch.long), torch.tensor(ends, dtype=torch.long)
 
 def SmartCutter(waveform, mask, sr=48000):
+    """Compatibility API backed by the conservative planner and native renderer."""
     waveform = waveform.cpu()
-    mask = mask.cpu()
-
-    if ENABLE_BRIDGING:
-        # Gap bridge operation
-        bridge_frames = 5 # At 100fps, 50ms is ~5 frames
-        mask = mask.view(1, 1, -1)
-
-        mask = torch.nn.functional.max_pool1d(mask, bridge_frames, 1, bridge_frames//2) # Dilation
-        mask = -torch.nn.functional.max_pool1d(-mask, bridge_frames, 1, bridge_frames//2) # Erosion
-
-    # Interpolate the low-res mask up to the full audio resolution.
-    if mask.dim() == 1: mask = mask.view(1, 1, -1)
-    elif mask.dim() == 2: mask = mask.unsqueeze(1)
-
-    target_size = waveform.shape[1]
-
-    mask_full = torch.nn.functional.interpolate(
-        mask, size=target_size, mode='linear', align_corners=True
-    ).squeeze()
-
-    # Calculate where to cut.
-    starts, ends = find_cuts(mask_full, waveform, sr)
-
-    # If mask is empty, return silence.
-    if len(starts) == 0:
-        return torch.zeros_like(waveform), mask_full
-
-    target_silence_samples = int(sr * SILENCE_TARGET_DURATION)
-    fade_samples = int(sr * (FADE_DURATION_MS / 1000))
-
-    pieces = []
-    last_valid_idx = 0
-
-    # Pre-allocate silence
-    silence_tensor = torch.zeros((waveform.shape[0], target_silence_samples))
-
-    start_list = starts.tolist()
-    end_list = ends.tolist()
-
-    for start_idx, end_idx in zip(start_list, end_list):
-        start_idx = int(start_idx)
-        end_idx = int(end_idx)
-
-        # Only process if there's actual data to cut.
-        if start_idx > last_valid_idx:
-            speech_chunk = waveform[:, last_valid_idx:start_idx].clone()
-
-            # Apply fades to the edges of the chunk to prevent clicks.
-            if last_valid_idx > 0:
-                speech_chunk = apply_fade(speech_chunk, fade_samples, mode="in")
-
-            speech_chunk = apply_fade(speech_chunk, fade_samples, mode="out")
-            pieces.append(speech_chunk)
-
-        # Insert clean silence between chunks.
-        pieces.append(silence_tensor)
-        last_valid_idx = end_idx
-
-    # Handle any remaining audio at the end.
-    if last_valid_idx < target_size:
-        tail_chunk = waveform[:, last_valid_idx:].clone()
-        if last_valid_idx > 0:
-            tail_chunk = apply_fade(tail_chunk, fade_samples, mode="in")
-        pieces.append(tail_chunk)
-
-    # Merge everything back into one tensor.
-    return torch.cat(pieces, dim=1), mask_full
+    probabilities = mask.detach().cpu().reshape(-1)
+    hop = sr // 100
+    policy = CutConfig(enter_probability=CUTTING_PROBABILITY, exit_probability=CUTTING_PROBABILITY,
+                       min_confident_ms=0, min_gap_ms=MIN_SEGMENT_DURATION_MS,
+                       target_gap_ms=SILENCE_TARGET_DURATION * 1000, padding_ms=SAFETY_BUFFER_MS,
+                       fade_ms=FADE_DURATION_MS, snap_ms=SEARCH_WINDOW_MS, use_boundaries=False)
+    plan = plan_cuts(probabilities, sr, waveform.shape[-1], waveform.shape[0], hop / sr,
+                     policy, waveform=waveform.numpy())
+    full_mask = probabilities.repeat_interleave(hop)[:waveform.shape[-1]]
+    return render_audio(waveform, plan), full_mask
 
 def process_grid_aligned(model, transform, waveform, sr, hop_length, device, static_input_buffer):
-    # Implements Weighted Overlap-Add (WOLA) inference.
-    # Processes audio in overlapping chunks and averages the results.
-    total_samples = waveform.shape[1]
-
-    CHUNK_SEC = SEGMENT_LEN
-    OVERLAP_SEC = CHUNK_SEC / 2
-
-    chunk_samples = int(CHUNK_SEC * sr)
-    overlap_samples = int(OVERLAP_SEC * sr)
-    stride_samples = chunk_samples - overlap_samples
-
-    # Dummy pass to get dimensions
-    dummy_input = torch.zeros(1, chunk_samples, device=device)
-    dummy_mel = transform(dummy_input)
-    frames_per_chunk = dummy_mel.shape[-1]
-
-    # Total framess estimation for CPU buffer allocation
-    total_frames = int(math.ceil(total_samples / hop_length)) + 100 # ample buffer
-
-    print(f"    -> WOLA chunking: Chunk={chunk_samples}, Overlap={overlap_samples}, Total Frames={total_frames}")
-
-    # Accumulators for the final mask and the window weights.
-    mask_accumulator = torch.zeros((1, total_frames), dtype=torch.float32, device='cpu')
-    weight_accumulator = torch.zeros((1, total_frames), dtype=torch.float32, device='cpu')
-
-    # Hanning window ensures the center of the prediction counts more than the edges.
-    window = torch.hann_window(frames_per_chunk, device=device).view(1, -1)
-    # Moving window to CPU for accumulation later
-    window_cpu = window.cpu()
-
-    current_sample = 0
-
-    with torch.no_grad():
-        while current_sample < total_samples:
-            start = current_sample
-            end = start + chunk_samples
-
-            chunk_wav = waveform[:, start:end]
-
-            # Pad
-            original_len = chunk_wav.shape[1]
-            if original_len < chunk_samples:
-                pad_amt = chunk_samples - original_len
-                chunk_wav = torch.nn.functional.pad(chunk_wav, (0, pad_amt))
-
-            # Move a chunk to GPU
-            chunk_wav = chunk_wav.to(device)
-
-            # Inference
-            raw_mask = _run_inference(model, transform, chunk_wav, device, static_input_buffer)
-
-            if raw_mask.dim() == 3: raw_mask = raw_mask.squeeze(1)
-
-            # Map to frames
-            start_frame = int(round(start / hop_length))
-
-            # Ensure we don't go out of bounds
-            if start_frame + frames_per_chunk > mask_accumulator.shape[1]:
-                # Expand CPU buffer dynamically if needed
-                extra = (start_frame + frames_per_chunk) - mask_accumulator.shape[1]
-                mask_accumulator = torch.nn.functional.pad(mask_accumulator, (0, extra))
-                weight_accumulator = torch.nn.functional.pad(weight_accumulator, (0, extra))
-
-            # Accumulate on CPU
-            current_pred_cpu = raw_mask.cpu() # Move pred to CPU
-
-            # Add weighted prediction to accumulator.
-            mask_accumulator[:, start_frame : start_frame + frames_per_chunk] += (current_pred_cpu * window_cpu)
-            weight_accumulator[:, start_frame : start_frame + frames_per_chunk] += window_cpu
-
-            current_sample += stride_samples
-
-    # Normalize by weights to get the final average.
-    weight_accumulator[weight_accumulator < 1e-6] = 1.0
-    final_mask = mask_accumulator / weight_accumulator
-
-    # Trim to actual size based on input waveform
-    actual_frames = int(total_samples / hop_length)
-    final_mask = final_mask[:, :actual_frames]
-
-    return final_mask
+    """Blend probabilities on an explicit grid, including short files and tails."""
+    total_frames = math.ceil(waveform.shape[-1] / hop_length)
+    chunk_frames = max(2, round(SEGMENT_LEN * sr / hop_length))
+    stride_frames = max(1, chunk_frames // 2)
+    accumulator = torch.zeros(1, total_frames)
+    weights = torch.zeros(1, total_frames)
+    window = torch.hann_window(chunk_frames, periodic=False).clamp_min(0.05)
+    with torch.inference_mode():
+        for first in range(0, total_frames, stride_frames):
+            last = min(total_frames, first + chunk_frames)
+            chunk = waveform[:, first * hop_length:min(waveform.shape[-1], last * hop_length)].to(device)
+            chunk = torch.nn.functional.pad(chunk, (0, chunk_frames * hop_length - chunk.shape[-1]))
+            prediction = _run_inference(model, transform, chunk, device, static_input_buffer).reshape(1, -1)
+            count = last - first
+            accumulator[:, first:last] += prediction[:, :count].cpu() * window[:count]
+            weights[:, first:last] += window[:count]
+    return accumulator / weights.clamp_min(1e-8)
 
 def _run_inference(model, mel_transform, wav_chunk, device, input_buffer):
-    # Standard forward pass: Waveform -> Mel -> Delta -> Model -> Mask.
-    mel = mel_transform(wav_chunk).squeeze(0)
-    mel = torchaudio.transforms.AmplitudeToDB()(mel)
-
-    # Normalize dB to 0-1 range.
-    min_db, max_db = -80.0, 0.0
-    mel = torch.clamp(mel, min=min_db, max=max_db)
-    mel = (mel - min_db) / (max_db - min_db)
-
-    # Compute deltas for extra temporal context.
-    delta = F_audio.compute_deltas(mel.unsqueeze(0)).squeeze(0)
-
-    # buffer pushing
-    current_frames = mel.shape[-1]
-    input_buffer[0, 0, :, :current_frames].copy_(mel)
-    input_buffer[0, 1, :, :current_frames].copy_(delta)
-
-    # Model Inference using the buffer slice
-    mask_2d = model(input_buffer[:, :, :, :current_frames])
-
-    # Collapse 2D output (freq/time) to 1D (time) based on strategy.
-    if MASK_MODE == "Soft":
-        mask_pred = torch.mean(mask_2d, dim=2)
-    elif MASK_MODE == "Hybrid":
-        soft_mask = torch.mean(mask_2d, dim=2)
-        hard_mask = torch.max(mask_2d, dim=2)[0]
-        mask_pred = (0.7 * soft_mask) + (0.3 * hard_mask)
-    elif MASK_MODE == "PowerMean":
-        mask_pred = torch.sqrt(torch.mean(mask_2d**2, dim=2))
-    elif MASK_MODE == "Hard":
-        mask_pred = torch.max(mask_2d, dim=2)[0]
-    else:
-        print(f"MASK_MODE: {MASK_MODE} is unsupported. Exiting.")
-        sys.exit(1)
-
-    return mask_pred
+    features = legacy_features(wav_chunk, mel_transform)
+    channel_masks = []
+    for channel in features:
+        frames = channel.shape[-1]
+        if frames > input_buffer.shape[-1]:
+            raise ValueError("Legacy input buffer is shorter than the feature grid")
+        input_buffer[0, :, :, :frames].copy_(channel)
+        # v3 emits logits. Every aggregation mode must operate on probabilities.
+        probabilities = model(input_buffer[:, :, :, :frames]).sigmoid()
+        if MASK_MODE == "Soft":
+            prediction = probabilities.mean(dim=2)
+        elif MASK_MODE == "Hybrid":
+            prediction = 0.7 * probabilities.mean(dim=2) + 0.3 * probabilities.amax(dim=2)
+        elif MASK_MODE == "PowerMean":
+            prediction = probabilities.square().mean(dim=2).sqrt()
+        elif MASK_MODE == "Hard":
+            prediction = probabilities.amax(dim=2)
+        else:
+            raise ValueError(f"Unsupported MASK_MODE: {MASK_MODE}")
+        channel_masks.append(prediction)
+    # Preserve the original channels and let any protected channel veto removal.
+    return torch.stack(channel_masks).amin(dim=0)
 
 def processing():
     # Device setup
@@ -429,25 +217,8 @@ def processing():
             # Audio loading
             wav, sr = torchaudio.load(f_path)
 
-            # If audio is stereo, we pick the one with the lowest DC offset
-            if wav.shape[0] > 1:
-                # Calculate absolute mean (DC offset) for each channel
-                dc_offsets = torch.abs(wav.mean(dim=1))
-
-                # Find the index of the channel with the minimum offset
-                best_ch_idx = torch.argmin(dc_offsets)
-
-                # Select that channel and keep dimensions as [1, Time]
-                wav = wav[best_ch_idx].unsqueeze(0)
-                print(f"    -> Converted Stereo to Mono (Selected Ch {best_ch_idx}, DC: {dc_offsets[best_ch_idx]:.6f})")
-
+            # Analysis retains every channel; preprocessing is shared with training.
             wav_for_inference = wav.clone()
-
-            # Safety norm on input
-            input_peak = torch.abs(wav_for_inference).max()
-            if input_peak > 0:
-                target_peak = 0.9 
-                wav_for_inference = wav_for_inference * (target_peak / input_peak)
 
             if STABILITY_NOISE:
                 wav_for_inference = inject_stability_noise(wav_for_inference, sr, wav.device)
@@ -469,6 +240,11 @@ def processing():
                 else:
                     model_path = os.path.join(CKPT_DIR, f"{MODEL_VERSION}_model_{sr}.pth")
 
+                if MODEL_VERSION == "v3" and not os.path.exists(model_path):
+                    candidates = [os.path.join(CKPT_DIR, f"v3_best_model_{sr}.pth"),
+                                  os.path.join(CKPT_DIR, f"v3_latest_model_{sr}.pth")]
+                    model_path = next((p for p in candidates if os.path.exists(p)), model_path)
+
                 if not os.path.exists(model_path):
                     print(f"Skipping {fname}: No {MODEL_VERSION} model for {sr}Hz")
                     continue
@@ -478,14 +254,19 @@ def processing():
                 if MODEL_VERSION == "v3":
                     model = DSCA_ResUNet_v3(n_channels=2, n_classes=1).to(device)   # v3
                 elif MODEL_VERSION == "v5":
+                    from model_v5 import CGA_ResUNet
                     model = CGA_ResUNet(n_channels=2, n_classes=1).to(device)       # v5
                 elif MODEL_VERSION == "v6":
+                    from model_v6 import CGTA_ResUNet
                     model = CGTA_ResUNet(n_channels=2, n_classes=1).to(device)      # v6
                 else:
                     print(f"'{MODEL_VERSION}' is not a valid model version choice. Exiting.")
                     sys.exit(1)
 
-                model.load_state_dict(torch.load(model_path, map_location=device))
+                checkpoint = torch.load(model_path, map_location=device, weights_only=True)
+                if "sample_rate" in checkpoint and checkpoint["sample_rate"] != sr:
+                    raise ValueError("Checkpoint sample rate differs from the audio")
+                model.load_state_dict(checkpoint.get("state_dict", checkpoint))
                 model.eval()
 
                 # mel transform config
@@ -497,7 +278,7 @@ def processing():
                     N_MELS = 128
 
                 mel_transform = torchaudio.transforms.MelSpectrogram(
-                    sample_rate=sr, n_mels=N_MELS, n_fft=N_FFT, hop_length=current_hop
+                    sample_rate=sr, n_mels=N_MELS, n_fft=N_FFT, hop_length=current_hop, pad_mode="constant"
                 ).to(device)
 
                 # we're pre-allocating a static buffer for the model input
@@ -531,12 +312,6 @@ def processing():
                 debug_wav = wav + (debug_noise * (binary_mask_interpolated > CUTTING_PROBABILITY).float())
                 torchaudio.save(os.path.join(OUT_DIR, "debug_" + os.path.basename(f_path)), debug_wav, sr)
 
-
-            # Volume Normalization
-            peak = torch.abs(cleaned).max()
-            if peak >= 0.95:
-                scale_factor = 0.95 / peak.item()
-                cleaned = cleaned * scale_factor
 
             # Output path construction
             file_stem = os.path.splitext(fname)[0]

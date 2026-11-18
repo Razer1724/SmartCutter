@@ -1,15 +1,15 @@
 import os
 import sys
-import glob
 import torch
 import torchaudio
-import torchaudio.functional as F_audio
 import torch.nn as nn
 import numpy as np
 import torch.optim as optim
 from torch.utils.data import Dataset, ConcatDataset, DataLoader
 from tqdm import tqdm
 from model_v3 import DSCA_ResUNet_v3
+from smartcutter.data import paired_files
+from smartcutter.frontend import legacy_features
 
 # Config
 INTENDED_SR_FOR_TRAIN = 48000  # Options: 32000, 40000, 48000
@@ -34,7 +34,6 @@ VALIDATE_INTERVAL = 1
 
 # Augmentation
 DYNAMIC_AUGMENTATION = True
-ENABLE_BRIDGING = True
 
 RANDOM_GAIN_AUG = True
 rand_gain_max = 1.0
@@ -139,7 +138,7 @@ class SlicedDataset(Dataset):
             sample_rate=SAMPLE_RATE, 
             n_mels=N_MELS, 
             n_fft=N_FFT, 
-            hop_length=HOP_LENGTH
+            hop_length=HOP_LENGTH, pad_mode="constant"
         )
         print(f"[DATASET] Processing {len(file_pairs)} file pairs...")
 
@@ -148,29 +147,16 @@ class SlicedDataset(Dataset):
             raw_wav, sr_r = torchaudio.load(r_file)
             marked_wav, sr_m = torchaudio.load(m_file)
 
-            # Resample if needed
-            if sr_r != SAMPLE_RATE: raw_wav = torchaudio.transforms.Resample(sr_r, SAMPLE_RATE)(raw_wav)
-            if sr_m != SAMPLE_RATE: marked_wav = torchaudio.transforms.Resample(sr_m, SAMPLE_RATE)(marked_wav)
-
-            # Match lengths
-            min_len = min(raw_wav.shape[1], marked_wav.shape[1])
-            raw_wav, marked_wav = raw_wav[:, :min_len], marked_wav[:, :min_len]
-
-            # Normalize
-            max_val = torch.max(torch.abs(marked_wav))
-            if max_val > 0.95:
-                scale = 0.95 / max_val
-                marked_wav *= scale
-                raw_wav *= scale
-
-            # Get the absolute difference
-            diff = torch.abs(marked_wav - raw_wav)
-
-            # Binary threshold
-            if STRICT_MASK:
-                mask = (diff > 1e-5).float() # 1e-7
-            else:
-                mask = (diff > 0.05).float()
+            if sr_r != sr_m or raw_wav.shape != marked_wav.shape:
+                raise ValueError(f"Misaligned raw/marked pair: {r_file}")
+            if not torch.isfinite(raw_wav).all() or not torch.isfinite(marked_wav).all():
+                raise ValueError(f"Non-finite samples: {r_file}")
+            # Derive labels before resampling or gain changes can create differences.
+            diff = torch.abs(marked_wav - raw_wav).amax(dim=0, keepdim=True)
+            mask = (diff > (1e-5 if STRICT_MASK else 0.05)).float()
+            if sr_r != SAMPLE_RATE:
+                raw_wav = torchaudio.functional.resample(raw_wav, sr_r, SAMPLE_RATE)
+                mask = torch.nn.functional.interpolate(mask.unsqueeze(0), size=raw_wav.shape[-1], mode="nearest")[0]
 
             if DEBUG_TRAINING_MASK:
                 debug_filename = f"DEBUG_{os.path.basename(r_file)}"
@@ -229,53 +215,18 @@ class SlicedDataset(Dataset):
                     raw_crop = raw_crop + (stab_noise * mask_crop)
 
 
-        # --------------------   Processing
-        # Prevent any potential clipping before stft
-        raw_crop = torch.clamp(raw_crop, -1.0, 1.0)
-        # Transform to mel
-        mel = self.mel_transform(raw_crop).squeeze(0) 
-
-        # log normalization
-        mel = torchaudio.transforms.AmplitudeToDB()(mel)
-        min_db = -80.0
-        max_db = 0.0
-        mel = torch.clamp(mel, min=min_db, max=max_db)
-        mel = (mel - min_db) / (max_db - min_db) # Scaled 0.0 to 1.0
-
-        # Deltas
-        delta = F_audio.compute_deltas(mel.unsqueeze(0)).squeeze(0)
-        combined_input = torch.stack([mel, delta], dim=0)
-
-        # Resize mask to match Mel dimensions
-        mask_final = torch.nn.functional.interpolate(
-            mask_crop.unsqueeze(0).unsqueeze(0),
-            size=(1, combined_input.shape[2]), # (1, Time)
-            mode='nearest'
-        ).squeeze(0).squeeze(0)
-
-        if ENABLE_BRIDGING:
-            # Gap bridging
-            bridge_frames = 5 # At 100fps, 50ms is ~5 frames
-            # Dilation
-            mask_final = torch.nn.functional.max_pool1d(mask_final.view(1,1,-1), bridge_frames, 1, bridge_frames//2)
-            # Erosion
-            mask_final = -torch.nn.functional.max_pool1d(-mask_final, bridge_frames, 1, bridge_frames//2).squeeze()
+        # This exact feature function is also used by v3 inference.
+        combined_input = legacy_features(raw_crop, self.mel_transform).amax(dim=0)
+        frames = combined_input.shape[-1]
+        padded = torch.nn.functional.pad(mask_crop, (0, frames * HOP_LENGTH - mask_crop.shape[-1]), value=1)
+        # A frame is removable only if every annotated sample in it is removable.
+        mask_final = padded.reshape(1, frames, HOP_LENGTH).amin(dim=-1).squeeze(0)
 
         return combined_input, mask_final
 
 
 def get_file_pairs(folder):
-    if not os.path.exists(folder):
-        return []
-
-    raw_files = sorted(glob.glob(os.path.join(folder, "*_raw.wav")) + glob.glob(os.path.join(folder, "*_raw.flac")))
-    marked_files = sorted(glob.glob(os.path.join(folder, "*_marked.wav")) + glob.glob(os.path.join(folder, "*_marked.flac")))
-
-    # Check to ensure pairs match up
-    if len(raw_files) != len(marked_files):
-        print(f"[WARNING] Mismatch in {folder}: {len(raw_files)} raw vs {len(marked_files)} marked.")
-
-    return list(zip(raw_files, marked_files))
+    return paired_files(folder) if os.path.isdir(folder) else []
 
 def validate(model, loader, device, bce_crit, dice_crit):
     model.eval()
@@ -370,6 +321,9 @@ def train():
             val_ds = SlicedDataset(val_pairs, overlap=0.0, augment=False)
     else:
         val_ds = SlicedDataset(val_pairs, overlap=0.0)
+
+    if len(train_ds) == 0 or len(val_ds) == 0:
+        raise ValueError("v3 training requires nonempty training and validation segments (at least 8 seconds)")
 
     # Dataloaders
     train_loader = DataLoader(
@@ -498,7 +452,9 @@ def train():
                 }
 
                 # save best performing model
-                torch.save(model.state_dict(), os.path.join(CKPT_DIR, f"v3_best_model_{SAMPLE_RATE}.pth"))
+                torch.save({"architecture": "v3", "format_version": 1, "sample_rate": SAMPLE_RATE,
+                            "frontend": "peak-cap-v1", "state_dict": model.state_dict()},
+                           os.path.join(CKPT_DIR, f"v3_best_model_{SAMPLE_RATE}.pth"))
                 print(f"\n  ----->  New Record! Score: {val_score:.4f}  <-----")
             else:
                 early_stop_counter += 1
@@ -510,7 +466,9 @@ def train():
                 break
 
         # most recent model saving
-        torch.save(model.state_dict(), os.path.join(CKPT_DIR, f"v3_latest_model_{SAMPLE_RATE}.pth"))
+        torch.save({"architecture": "v3", "format_version": 1, "sample_rate": SAMPLE_RATE,
+                    "frontend": "peak-cap-v1", "state_dict": model.state_dict()},
+                   os.path.join(CKPT_DIR, f"v3_latest_model_{SAMPLE_RATE}.pth"))
 
     # print the summary
     print("\n" + "="*50)

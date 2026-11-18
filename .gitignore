@@ -14,3 +14,15 @@ ckpts/*
 !training_files/.gitkeep
 !validation_files/.gitkeep
 !ckpts/.gitkeep
+
+# Local training runs, packages and annotation/audio collections
+.venv/
+__pycache__/
+*.egg-info/
+build/
+dist/
+runs/
+data/
+reports/
+.pytest_cache/
+.ruff_cache/
